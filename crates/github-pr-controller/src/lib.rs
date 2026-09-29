@@ -2058,7 +2058,6 @@ async fn dispatch_abandoned(
         for (kind, payload) in writes {
             if let Err(error) = store.enqueue_write(session_id, kind, &payload).await {
                 tracing::error!(%error, session_id, kind, "timeout write enqueue failed");
-                return false;
             }
         }
     }
@@ -5459,6 +5458,52 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn timeout_enqueue_failure_does_not_skip_remaining_writes() {
+        for failed_kind in [closing::KIND_COMMENT, closing::KIND_STATUS] {
+            let uri = "file:timeout_enqueue_failure?mode=memory&cache=shared";
+            let store = SqliteStore::open(uri).unwrap();
+            let connection = rusqlite::Connection::open(uri).unwrap();
+            connection
+                .execute_batch(&format!(
+                    "CREATE TRIGGER fail_timeout_write BEFORE INSERT ON github_writes
+                 WHEN NEW.kind = '{failed_kind}'
+                 BEGIN SELECT RAISE(FAIL, 'injected enqueue failure'); END;"
+                ))
+                .unwrap();
+            store
+                .record_session_target(
+                    "ses_timeout_failure",
+                    "example/repo",
+                    7,
+                    Some(COMMIT_ID),
+                    None,
+                    Some(2),
+                )
+                .unwrap();
+            let state = Arc::new(AppState::with_components(
+                external_config(&[7; 32]),
+                store,
+                None,
+                None,
+            ));
+            let store = state.store.as_ref().unwrap();
+            let event = serde_json::from_value(json!({
+                "version":"1", "event_id":"timeout_failure", "controller_id":"github-canary",
+                "event_type":"session.timeout", "session_id":"ses_timeout_failure",
+                "occurred_at":1000, "payload":{"reason":"timeout"}
+            }))
+            .unwrap();
+            assert!(dispatch_abandoned(&state, store, &event).await);
+            let writes = store.pending_writes(10).await.unwrap();
+            assert_eq!(writes.len(), 2);
+            assert!(writes
+                .iter()
+                .any(|w| w.kind == closing::KIND_COMMENT_ABANDON));
+            assert!(!writes.iter().any(|w| w.kind == failed_kind));
+        }
     }
 
     #[tokio::test]
