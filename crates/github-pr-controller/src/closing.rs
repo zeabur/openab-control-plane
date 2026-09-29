@@ -380,6 +380,41 @@ fn classify_integrity(target: &SessionTarget, parsed: &ParsedResult) -> Integrit
             reviewed_sha: Some(reviewed_raw.to_string()),
         };
     }
+    // A valid SHA and trailer alone cannot authorize a review without the
+    // report the controller will actually publish. Inspect the same last
+    // anchor as comment_body, excluding trailing working noise.
+    let report = parsed
+        .source
+        .rsplit_once(REPORT_START)
+        .map(|(_, report)| report.split("[[verdict:").next().unwrap_or_default());
+    let report_failure = match report {
+        None => Some("missing_report"),
+        Some(report)
+            if !report.lines().any(|line| {
+                line.trim()
+                    .strip_prefix("Reviewed at ")
+                    .is_some_and(|claim| {
+                        let sha = claim
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or_default()
+                            .trim_matches('`');
+                        canonical_commit_id(sha).as_deref() == Some(target_commit_id.as_str())
+                    })
+            }) =>
+        {
+            Some("missing_reviewed_at")
+        }
+        _ => None,
+    };
+    if let Some(disposition) = report_failure {
+        return IntegrityDecision {
+            disposition,
+            target_commit_id: Some(target_commit_id),
+            verified_commit_id: None,
+            reviewed_sha: Some(reviewed_commit_id),
+        };
+    }
     IntegrityDecision {
         disposition: "verified",
         target_commit_id: Some(reviewed_commit_id.clone()),
@@ -409,7 +444,7 @@ fn plan_sha_integrity_failure(
         .unwrap_or("unknown");
     let marker = round_marker(session_id);
     let diagnostic = format!(
-        "⚠️ Review SHA integrity failed ({}) for `{verdict}`. Approval or change-request review was withheld; no findings or waiver effects were recorded. Re-run the council for this pull request.\n\n{marker}",
+        "⚠️ Review integrity failed ({}) for `{verdict}`. Approval or change-request review was withheld; no findings or waiver effects were recorded. Re-run the council for this pull request.\n\n{marker}",
         integrity.disposition
     );
     let mut writes = vec![(
@@ -430,7 +465,7 @@ fn plan_sha_integrity_failure(
                 "commit_id": sha,
                 "state": "error",
                 "context": STATUS_CONTEXT,
-                "description": format!("council error - SHA integrity failed ({})", integrity.disposition),
+                "description": format!("council error - integrity failed ({})", integrity.disposition),
             }),
         ));
     }
@@ -696,14 +731,18 @@ mod tests {
                 head_sha: Some("0123456789abcdef0123456789abcdef01234567".into()),
                 findings: vec![],
             }),
-            source: source.into(),
+            source: if source.contains(REPORT_START) {
+                source.into()
+            } else {
+                format!("<!-- openab-council -->\nReviewed at 0123456789abcdef0123456789abcdef01234567\n{source}")
+            },
         }
     }
 
     #[test]
     fn an_approve_becomes_a_comment_a_success_status_and_a_formal_approval() {
         let parsed = valid_parsed(
-            "<!-- openab-council -->\nLGTM\n[[verdict:approve r=0 y=0 g=2]] [done]",
+            "<!-- openab-council -->\nReviewed at 0123456789abcdef0123456789abcdef01234567\nLGTM\n[[verdict:approve r=0 y=0 g=2]] [done]",
             "[[verdict:approve r=0 y=0 g=2]] [done]",
         );
         let plan = plan_close(&target(), &parsed, None, "ses_t", false);
@@ -728,7 +767,7 @@ mod tests {
         );
         assert_eq!(
             write(&plan, KIND_COMMENT)["body"],
-            format!("<!-- openab-council -->\nLGTM\n\n{}", round_marker("ses_t")),
+            format!("<!-- openab-council -->\nReviewed at 0123456789abcdef0123456789abcdef01234567\nLGTM\n\n{}", round_marker("ses_t")),
             "the comment carries its round marker"
         );
     }
@@ -746,7 +785,7 @@ mod tests {
     fn findings_result(trailer: &str, head_sha: Option<&str>) -> ParsedResult {
         let body = match head_sha {
             Some(head_sha) => format!(
-                "report\n<!-- openab-findings\n{{\"head_sha\":\"{head_sha}\",\"findings\":[{{\"id\":\"F1\",\"severity\":\"yellow\",\"title\":\"finding\"}}]}}\n-->\n{trailer}"
+                "<!-- openab-council -->\nReviewed at 0123456789abcdef0123456789abcdef01234567\nreport\n<!-- openab-findings\n{{\"head_sha\":\"{head_sha}\",\"findings\":[{{\"id\":\"F1\",\"severity\":\"yellow\",\"title\":\"finding\"}}]}}\n-->\n{trailer}"
             ),
             None => format!("report\n{trailer}"),
         };
@@ -888,7 +927,8 @@ mod tests {
     fn fenced_findings_tables_are_unwrapped_but_code_blocks_survive() {
         // Shape of nuphos#664: the chair fences the table header and body as
         // separate blocks. A real code block in the same report must remain.
-        let report = "<!-- openab-council -->\n\
+        let report =
+            "<!-- openab-council -->\nReviewed at 0123456789abcdef0123456789abcdef01234567\n\
              CHANGES REQUESTED ⚠️ — summary.\n\n\
              ## Findings\n\n\
              ```\n\
@@ -918,7 +958,7 @@ mod tests {
         let synthesis = "✅ `Creating task list: Synthesize round 3 verdict`\n\
              ✅ `Running: printf '%s' '{\"pullNumber\":309}' | octobroker-mcp call pull_request_read`\n\
              Good — the head SHA is unchanged. I've verified the file. No issues.\
-             <!-- openab-council -->\n\
+             <!-- openab-council -->\nReviewed at 0123456789abcdef0123456789abcdef01234567\n\
              LGTM ✅ — Docs-only change.\n\
              Reviewed at 701a1bf (round 3)\n\n\
              ## Delta since d3fbb56\n\n- One appended line.";
@@ -957,7 +997,7 @@ mod tests {
         let noisy = "<!-- openab-council --> ; CHANGES REQUESTED ⚠️ — draft title ; R...`\n\
              ✅ `Running: /home/agent/bin/octobroker-mcp comment zeabur nuphos 725 < /tmp/verdict.md`\n\
              Now I need to verify the finding myself before writing the verdict.\n\
-             <!-- openab-council -->\n\
+             <!-- openab-council -->\nReviewed at 0123456789abcdef0123456789abcdef01234567\n\
              CHANGES REQUESTED ⚠️ — the real report.\n\n\
              ## Findings\n\n| F1 | 🟡 | real |\n\n\
              [[verdict:request_changes r=0 y=1 g=0]] [done]";
@@ -965,7 +1005,7 @@ mod tests {
         let plan = plan_close(&target(), &parsed, None, "ses_t", false);
         let body = write(&plan, KIND_COMMENT)["body"].as_str().unwrap();
         assert!(
-            body.starts_with("<!-- openab-council -->\nCHANGES REQUESTED ⚠️ — the real report."),
+            body.starts_with("<!-- openab-council -->\nReviewed at 0123456789abcdef0123456789abcdef01234567\nCHANGES REQUESTED ⚠️ — the real report."),
             "the LAST anchor opens the comment: {body}"
         );
         assert!(
@@ -980,7 +1020,7 @@ mod tests {
         // trailer, MORE tool transcript, then a second draft. Everything from
         // the first trailer line on is machine tail, except that a re-draft
         // with its own anchor supersedes the lot.
-        let one_draft_then_noise = "<!-- openab-council -->\n\
+        let one_draft_then_noise = "<!-- openab-council -->\nReviewed at 0123456789abcdef0123456789abcdef01234567\n\
              CHANGES REQUESTED ⚠️ — the report.\n\n\
              [[verdict:request_changes r=0 y=2 g=1]] [done]\n\
              ✅ `Running: printf '%s' '{\"pullNumber\":725}' | /home/agent/bin/octobroker-mcp call pull_request_read`\n\
@@ -1002,11 +1042,12 @@ mod tests {
             "the report ends at its trailer, then the round marker: {body}"
         );
 
-        let redraft = "<!-- openab-council -->\n\
+        let redraft =
+            "<!-- openab-council -->\nReviewed at 0123456789abcdef0123456789abcdef01234567\n\
              CHANGES REQUESTED ⚠️ — superseded draft.\n\
              [[verdict:request_changes r=0 y=2 g=1]] [done]\n\
              ✅ `Running: octobroker-mcp call pull_request_read`\n\
-             <!-- openab-council -->\n\
+             <!-- openab-council -->\nReviewed at 0123456789abcdef0123456789abcdef01234567\n\
              CHANGES REQUESTED ⚠️ — the final draft.\n\
              [[verdict:request_changes r=0 y=2 g=1]] [done]";
         let parsed = valid_parsed(redraft, "[[verdict:request_changes r=0 y=2 g=1]] [done]");
@@ -1025,7 +1066,7 @@ mod tests {
     #[test]
     fn the_review_names_the_sha_it_stands_behind() {
         let parsed = parse_final_messages(&[
-            "report\n<!-- openab-findings\n{\"head_sha\":\"0123456789ABCDEF0123456789ABCDEF01234567\",\"findings\":[]}\n-->\n[[verdict:approve r=0 y=0 g=1]] [done]".into(),
+            "<!-- openab-council -->\nReviewed at 0123456789abcdef0123456789abcdef01234567\nreport\n<!-- openab-findings\n{\"head_sha\":\"0123456789ABCDEF0123456789ABCDEF01234567\",\"findings\":[]}\n-->\n[[verdict:approve r=0 y=0 g=1]] [done]".into(),
         ]);
         let plan = plan_close(&target(), &parsed, None, "ses_t", false);
         let body = write(&plan, KIND_REVIEW)["body"].as_str().unwrap();
@@ -1159,36 +1200,23 @@ mod tests {
     }
 
     #[test]
-    fn an_anchorless_close_with_a_verdict_posts_a_summary_not_the_transcript() {
-        // backend#2418 round 4: a -32603 mid-synthesis error prepended an error
-        // banner and a tool transcript, the chair never emitted the council
-        // anchor, but a verdict still parsed. The comment must carry the verdict
-        // and findings — never the banner or the transcript.
-        let parsed = parse_final_messages(&[concat!(
-            "⚠️ **Internal Error** (code: -32603)\n",
-            "✅ `Running: octobroker-mcp call pull_request_read`\n",
-            "Received rev-codex's report. Waiting for rev-claude.\n",
-            "<!-- openab-findings\n",
-            "{\"head_sha\":\"0123456789ABCDEF0123456789ABCDEF01234567\",\"findings\":[{\"id\":\"F7\",\"severity\":\"green\",\"title\":\"skip\"}]}\n-->\n",
-            "[[verdict:approve r=0 y=0 g=2]] [done]"
-        )
-        .into()]);
-        let plan = plan_close(&target(), &parsed, None, "ses_r4", false);
-        // Verdict still drives status + review.
-        assert_eq!(kinds(&plan), [KIND_COMMENT, KIND_STATUS, KIND_REVIEW]);
-        let body = write(&plan, KIND_COMMENT)["body"].as_str().unwrap();
-        assert!(
-            !body.contains("Internal Error")
-                && !body.contains("Running")
-                && !body.contains("rev-claude"),
-            "banner/transcript leaked: {body}"
-        );
-        assert!(body.contains("approve"), "verdict summary missing: {body}");
-        assert!(
-            body.contains("openab-findings") && body.contains("F7"),
-            "findings block should survive: {body}"
-        );
-        assert!(!body.contains("[[verdict:"), "raw trailer leaked: {body}");
+    fn incomplete_report_cannot_publish_either_verdict_or_findings() {
+        for verdict in ["approve", "request_changes"] {
+            for prefix in [
+                "",
+                "<!-- openab-council -->\n",
+                "<!-- openab-council -->\nReviewed at deadbeef\n",
+            ] {
+                let source = format!("{prefix}Report prose\n<!-- openab-findings\n{{\"head_sha\":\"0123456789abcdef0123456789abcdef01234567\",\"findings\":[]}}\n-->\n[[verdict:{verdict} r=0 y=0 g=0]] [done]");
+                let parsed = parse_final_messages(&[source]);
+                let plan = plan_close(&target(), &parsed, None, "ses_incomplete", false);
+                assert_eq!(kinds(&plan), [KIND_COMMENT, KIND_STATUS]);
+                assert_eq!(write(&plan, KIND_STATUS)["state"], "error");
+                assert!(plan.findings.is_empty());
+                assert!(plan.fired_waivers.is_empty());
+                assert!(plan.verified_commit_id.is_none());
+            }
+        }
     }
 
     #[test]
@@ -1197,7 +1225,7 @@ mod tests {
         // could park one on a commit nobody reviewed (council F1, #305). The
         // claimed sha is still recorded — it describes what was read.
         let parsed = parse_final_messages(&[concat!(
-            "report\n",
+            "<!-- openab-council -->\nReviewed at 0123456789abcdef0123456789abcdef01234567\nreport\n",
             "<!-- openab-findings\n",
             "{\"head_sha\":\"0123456789ABCDEF0123456789ABCDEF01234567\",\"findings\":[",
             "{\"id\":\"F1\",\"severity\":\"yellow\",\"title\":\"races\"}]}\n-->\n",
@@ -1242,7 +1270,7 @@ mod tests {
     #[test]
     fn the_comment_drops_machine_tails_but_keeps_the_findings_block() {
         let parsed = parse_final_messages(&[concat!(
-            "<!-- openab-council -->\n## Verdict\n\nprose here\n\n",
+            "<!-- openab-council -->\nReviewed at 0123456789abcdef0123456789abcdef01234567\n## Verdict\n\nprose here\n\n",
             "<!-- openab-findings\n{\"head_sha\":\"0123456789ABCDEF0123456789ABCDEF01234567\",\"findings\":[]}\n-->\n",
             "[[verdict:approve r=0 y=0 g=0]] [done]"
         )
@@ -1254,7 +1282,7 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        assert!(body.starts_with("<!-- openab-council -->\n## Verdict"));
+        assert!(body.starts_with("<!-- openab-council -->\nReviewed at 0123456789abcdef0123456789abcdef01234567\n## Verdict"));
         assert!(
             body.contains("openab-findings"),
             "block is invisible, keep it"

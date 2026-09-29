@@ -12,6 +12,20 @@ pub fn report_delivered(text: &str) -> bool {
         && !is_bare_tool_echo(text)
 }
 
+/// Formal reviews require an explicit completed inspection, not just prose or
+/// a transport done reaction. Blocked and partial turns omit this trailer.
+pub fn review_report_delivered(text: &str) -> bool {
+    let text = text
+        .trim()
+        .strip_suffix("[done]")
+        .unwrap_or(text.trim())
+        .trim_end();
+    let Some(report) = text.strip_suffix("[[review:complete]]") else {
+        return false;
+    };
+    report_delivered(report) && !report.contains("[[review:blocked]]")
+}
+
 fn is_bare_tool_echo(text: &str) -> bool {
     let first_line = text.lines().next().unwrap_or_default().trim();
     let lower = text.to_ascii_lowercase();
@@ -87,6 +101,26 @@ pub fn runtime_council_roster(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn formal_review_requires_completed_inspection_not_a_done_vote() {
+        for report in [
+            "Python is unavailable; security preflight blocked before inspection. [done]",
+            "I will inspect the changed files next. [done]",
+            "⚠️ Service Busy All agent sessions are in use, please try again shortly.\n[[review:complete]] [done]",
+            "⚠️ Internal Error (code: -32603)\nPartial findings with enough content.\n[[review:complete]] [done]",
+            "Inspection blocked by repository permissions. [[review:blocked]] [done]",
+            "[[review:complete]] [done]",
+        ] {
+            assert!(!review_report_delivered(report), "{report}");
+        }
+        assert!(review_report_delivered(
+            "Inspected auth.rs:42 and its callers; the token check is sound.\n[[review:complete]]\n[done]"
+        ));
+        assert!(!review_report_delivered(include_str!(
+            "../../../tests/fixtures/claude-subscription-disabled.txt"
+        )));
+    }
 
     #[test]
     fn report_delivery_rejects_short_echoes_but_keeps_concise_findings() {

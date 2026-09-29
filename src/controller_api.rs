@@ -3145,7 +3145,7 @@ mod tests {
             "rev1",
             bot_reply(
                 &active_session,
-                "Review one: the changed path is covered and has no blocking issue. [done]",
+                "Review one: the changed path is covered and has no blocking issue. [[review:complete]] [done]",
             ),
         )
         .unwrap();
@@ -3154,7 +3154,7 @@ mod tests {
             "rev2",
             bot_reply(
                 &active_session,
-                "Review two: the changed path is covered and has no blocking issue. [done]",
+                "Review two: the changed path is covered and has no blocking issue. [[review:complete]] [done]",
             ),
         )
         .unwrap();

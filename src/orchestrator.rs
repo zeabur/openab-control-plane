@@ -1368,6 +1368,14 @@ fn account_bot_health(state: &Arc<AppState>, session_id: &str, bot_id: &str, tex
     if is_streaming_stub(text) {
         return; // partial stub — wait for the settled content
     }
+    // Shared execution capacity is not evidence that this bot's provider is
+    // unhealthy. Reject the report without triggering provider failover or
+    // treating the busy frame as a successful recovery.
+    if crate::turn_failure::classify_legacy_turn_failure(text)
+        == Some(crate::turn_failure::LegacyTurnFailureKind::LocalCapacity)
+    {
+        return;
+    }
     let threshold = health_error_threshold();
     let is_error = is_agent_error_frame(text);
     match state.store.record_bot_frame(bot_id, is_error, threshold) {
@@ -2850,6 +2858,22 @@ mod tests {
     }
 
     #[test]
+    fn service_busy_neither_degrades_nor_recovers_provider_health() {
+        let (state, store, session, chair, _rev1, _rev2, _conns) = liveness_setup();
+        let busy = "⚠️ Service Busy All agent sessions are in use, please try again shortly.";
+        for _ in 0..5 {
+            handle_reply(&state, &chair, msg_reply(&session.id, busy)).unwrap();
+        }
+        assert_eq!(store.bot_inventory(&chair).unwrap().unwrap().health, "ok");
+        store.record_bot_frame(&chair, true, 1).unwrap();
+        handle_reply(&state, &chair, msg_reply(&session.id, busy)).unwrap();
+        assert_eq!(
+            store.bot_inventory(&chair).unwrap().unwrap().health,
+            "degraded"
+        );
+    }
+
+    #[test]
     fn error_frames_through_handle_reply_degrade_then_recover_the_bot() {
         // End-to-end wiring (ADR 023 Phase 1): a bot posting `-32603` error frames
         // via the real reply path crosses to `degraded`, and a later content frame
@@ -3253,7 +3277,7 @@ mod tests {
             &rev1,
             msg_reply(
                 &session.id,
-                "Findings: the changed path is covered and has no blocking issue. [done]",
+                "Findings: the changed path is covered and has no blocking issue. [[review:complete]] [done]",
             ),
         )
         .unwrap();
@@ -3499,7 +3523,7 @@ mod tests {
             &reviewer.id,
             msg_reply(
                 &session.id,
-                "Finding: the retry path loses the request id; preserve it before dispatch. [done]",
+                "Finding: the retry path loses the request id; preserve it before dispatch. [[review:complete]] [done]",
             ),
         )
         .unwrap();
