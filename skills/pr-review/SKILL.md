@@ -227,3 +227,5 @@ Merged explanation from reviewers. Preserve disagreement when it matters.
 
 Use `LGTM ✅` when there are no critical findings. Use
 `CHANGES REQUESTED ⚠️` when any `🔴` finding remains.
+
+Reviewer completion contract: Only after actually inspecting the PR and completing your assigned checks, end your report with `[[review:complete]]` immediately before `[done]`. If a missing tool, access failure, provider error, or incomplete inspection blocks your review, use `[[review:blocked]]` instead. A done reaction alone does not establish a valid review. Never claim completion for an uninspected PR. This contract applies to reviewers, not chair synthesis.

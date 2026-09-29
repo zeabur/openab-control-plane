@@ -8,6 +8,7 @@
 pub enum LegacyTurnFailureKind {
     SubscriptionDisabled,
     Protocol,
+    LocalCapacity,
 }
 
 const CLAUDE_SUBSCRIPTION_DISABLED: &str =
@@ -21,7 +22,9 @@ pub fn starts_with_runtime_error_banner(content: &str) -> bool {
     let first_line = content.lines().next().unwrap_or_default().trim();
     let first_lower = first_line.to_ascii_lowercase();
     first_line.starts_with('\u{26a0}')
-        && (first_lower.contains("-32603") || first_lower.contains("internal error"))
+        && (first_lower.contains("-32603")
+            || first_lower.contains("internal error")
+            || first_lower.contains("service busy"))
 }
 
 /// Classify a settled legacy gateway frame without treating ordinary review
@@ -35,6 +38,13 @@ pub fn classify_legacy_turn_failure(content: &str) -> Option<LegacyTurnFailureKi
     let lower = content.to_ascii_lowercase();
     let runtime_banner = starts_with_runtime_error_banner(content);
 
+    if lower
+        .lines()
+        .next()
+        .is_some_and(|line| line.starts_with('⚠') && line.contains("service busy"))
+    {
+        return Some(LegacyTurnFailureKind::LocalCapacity);
+    }
     if runtime_banner && lower.contains(CLAUDE_SUBSCRIPTION_DISABLED) {
         return Some(LegacyTurnFailureKind::SubscriptionDisabled);
     }

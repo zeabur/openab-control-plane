@@ -204,7 +204,7 @@ fn counted_done_voters(cx: &dyn Ctx, explicit: bool) -> Vec<String> {
         .filter(|bot| {
             cx.latest_settled(bot)
                 .as_deref()
-                .is_some_and(crate::plugins::council::report_delivered)
+                .is_some_and(crate::plugins::council::review_report_delivered)
         })
         .collect()
 }
@@ -232,7 +232,7 @@ fn reviewer_report_delivered(cx: &dyn Ctx, bot: &str, explicit: bool) -> bool {
         || cx
             .latest_settled(bot)
             .as_deref()
-            .is_some_and(crate::plugins::council::report_delivered)
+            .is_some_and(crate::plugins::council::review_report_delivered)
 }
 
 fn invalid_reviewer_action(bot: &str, attempts: i64) -> Action {
@@ -245,7 +245,7 @@ fn invalid_reviewer_action(bot: &str, attempts: i64) -> Action {
     Action::Prompt {
         to: bot.to_string(),
         content: format!(
-            "{REVIEWER_REREQUEST_PREFIX} attempt {attempt}. Your previous completion did not deliver a report. Reply with your concise findings and end the message with [done]."
+            "{REVIEWER_REREQUEST_PREFIX} attempt {attempt}. Your previous completion did not deliver a report. After actually inspecting the PR, reply with your concise findings, then [[review:complete]] and [done]. If blocked or incomplete, use [[review:blocked]] instead; never claim completion."
         ),
     }
 }
@@ -642,11 +642,12 @@ mod tests {
                 ("chair".into(), final_msg.into()),
                 (
                     "rev-a".into(),
-                    "Reviewer report with enough substance".into(),
+                    "Reviewer report with enough substance\n[[review:complete]] [done]".into(),
                 ),
                 (
                     "rev-b".into(),
-                    "Another reviewer report with enough substance".into(),
+                    "Another reviewer report with enough substance\n[[review:complete]] [done]"
+                        .into(),
                 ),
             ]),
             quorum_n: 2,
@@ -656,6 +657,21 @@ mod tests {
             attempts: 1, // the initial synthesis prompt has been sent
             trigger_ref: None,
         }
+    }
+
+    #[test]
+    fn blocked_reviewer_cannot_complete_quorum_or_authorize_chair_approval() {
+        let mut cx = quorum_ctx(&trailed());
+        cx.settled.insert(
+            "rev-b".into(),
+            "Python unavailable; security preflight blocked before PR inspection. [done]".into(),
+        );
+        assert_eq!(reviewer_completion(&cx, true).valid_reviewers, 1);
+        cx.state = SessionState::Deliberating;
+        let actions = council_on_done(&cx, "chair", COUNCIL_QUORUM_PROMPT, true);
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, Action::Close { verdict, .. } if !verdict.is_empty())));
     }
 
     #[test]

@@ -2007,10 +2007,13 @@ async fn dispatch_abandoned(
     store: &Arc<dyn ProductStore>,
     event: &runtime_events::RuntimeEventEnvelope,
 ) -> bool {
-    let kind = match event.event_type.as_str() {
-        "session.superseded" | "session.timeout" => closing::KIND_COMMENT_ABANDON,
-        _ => return false,
-    };
+    let timed_out = event.event_type == "session.timeout"
+        || (event.event_type == "session.terminal"
+            && event.payload["reason"].as_str() == Some("timeout"));
+    if !timed_out && event.event_type != "session.superseded" {
+        return false;
+    }
+    let kind = closing::KIND_COMMENT_ABANDON;
     let Some(session_id) = event.session_id.as_deref() else {
         return false;
     };
@@ -2022,6 +2025,43 @@ async fn dispatch_abandoned(
             return false;
         }
     };
+    // A timeout must be visible even if the opening comment was never posted.
+    // Supersede deliberately does not write a status: the replacement round
+    // may be reviewing the same SHA.
+    if timed_out && target.reason.as_deref() != Some("ask") {
+        let mut writes = vec![(
+            closing::KIND_COMMENT,
+            json!({
+                "repo": target.repo,
+                "pr_number": target.pr_number,
+                "comment_id": Value::Null,
+                "body": format!("⚠️ Review Council timed out without a verdict. No formal review was submitted. Re-run the council after reviewer readiness is restored.\n\n{}", closing::round_marker(session_id)),
+            }),
+        )];
+        if let Some(sha) = target
+            .head_sha
+            .as_deref()
+            .and_then(closing::canonical_commit_id)
+        {
+            writes.push((
+                closing::KIND_STATUS,
+                json!({
+                    "repo": target.repo,
+                    "sha": sha,
+                    "commit_id": sha,
+                    "state": "error",
+                    "context": closing::STATUS_CONTEXT,
+                    "description": "council error - review timed out",
+                }),
+            ));
+        }
+        for (kind, payload) in writes {
+            if let Err(error) = store.enqueue_write(session_id, kind, &payload).await {
+                tracing::error!(%error, session_id, kind, "timeout write enqueue failed");
+                return false;
+            }
+        }
+    }
     // The tombstone keeps the opening post's marker: the abandon write
     // reconciles (and replays) against the "started" comment it rewrites.
     let marker = closing::open_marker(session_id);
@@ -4317,7 +4357,7 @@ mod tests {
         // The chair's block: one waived finding naming the own-repo waiver and
         // one naming the foreign repo's — the second must bump nothing.
         let body = format!(
-            "report\n<!-- openab-findings\n{{\"head_sha\":\"{COMMIT_ID}\",\"findings\":[\
+            "<!-- openab-council -->\nReviewed at {COMMIT_ID}\nreport\n<!-- openab-findings\n{{\"head_sha\":\"{COMMIT_ID}\",\"findings\":[\
              {{\"id\":\"F1\",\"severity\":\"yellow\",\"status\":\"waived\",\
               \"title\":\"waived one\",\"waiver_id\":\"{}\"}},\
              {{\"id\":\"F2\",\"severity\":\"yellow\",\"status\":\"waived\",\
@@ -5352,6 +5392,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn timeout_without_opening_comment_posts_error_once_and_never_a_review() {
+        let secret = vec![7; 32];
+        let config = external_config(&secret);
+        let verifier = runtime_events::RuntimeEventVerifier::new(
+            "github-canary",
+            config.event_signing_secret.as_deref().unwrap(),
+        )
+        .unwrap();
+        let store = SqliteStore::memory().unwrap();
+        store
+            .record_session_target(
+                "ses_timeout",
+                "example/repo",
+                7,
+                Some(COMMIT_ID),
+                None,
+                Some(2),
+            )
+            .unwrap();
+        let state = Arc::new(AppState::with_components(
+            config,
+            store,
+            Some(Arc::new(RecordingActionClient::new([]).0)),
+            Some(Arc::new(verifier)),
+        ));
+        let store = state.store.clone().unwrap();
+        let app = router(state);
+        for (index, event_type) in ["session.timeout", "session.terminal", "session.timeout"]
+            .iter()
+            .enumerate()
+        {
+            let id = format!("timeout_{index}");
+            let body = json!({
+                "version":"1", "event_id":id, "controller_id":"github-canary",
+                "event_type":event_type, "session_id":"ses_timeout", "occurred_at":1000,
+                "payload":{"reason":"timeout"}
+            })
+            .to_string();
+            let response = app
+                .clone()
+                .oneshot(signed_runtime_event_request(
+                    &secret,
+                    &id,
+                    "/api/v1/openab/events?version=1",
+                    body,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let writes = store.pending_writes(10).await.unwrap();
+        assert_eq!(writes.len(), 3);
+        assert!(!writes.iter().any(|w| w.kind == closing::KIND_REVIEW));
+        let status = writes
+            .iter()
+            .find(|w| w.kind == closing::KIND_STATUS)
+            .unwrap();
+        assert_eq!(status.payload["state"], "error");
+        assert_eq!(status.payload["sha"], COMMIT_ID);
+        let comment = writes
+            .iter()
+            .find(|w| w.kind == closing::KIND_COMMENT)
+            .unwrap();
+        assert!(comment.payload["body"]
+            .as_str()
+            .unwrap()
+            .contains("timed out"));
+    }
+
+    #[tokio::test]
     async fn a_closed_round_becomes_persisted_state_and_queued_writes() {
         let event_secret = vec![7; 32];
         let config = external_config(&event_secret);
@@ -5386,7 +5496,7 @@ mod tests {
                 "valid_reviewers": 2,
                 "final_messages": [
                     format!(
-                        "## Verdict\n\nprose\n<!-- openab-findings\n{{\"head_sha\":\"{COMMIT_ID}\",\"findings\":[{{\"id\":\"F1\",\"severity\":\"yellow\",\"title\":\"races on close\"}}]}}\n-->\n[[verdict:request_changes r=0 y=1 g=2]] [done]"
+                        "<!-- openab-council -->\nReviewed at {COMMIT_ID}\n## Verdict\n\nprose\n<!-- openab-findings\n{{\"head_sha\":\"{COMMIT_ID}\",\"findings\":[{{\"id\":\"F1\",\"severity\":\"yellow\",\"title\":\"races on close\"}}]}}\n-->\n[[verdict:request_changes r=0 y=1 g=2]] [done]"
                     )
                 ]
             }
@@ -6187,7 +6297,7 @@ mod tests {
                 "required_valid_reviewers": 2,
                 "valid_reviewers": 2,
                 "final_messages": [format!(
-                    "<!-- openab-council -->\n## Verdict\n\nblocked\n<!-- openab-findings\n{{\"head_sha\":\"{COMMIT_ID}\",\"findings\":[]}}\n-->\n[[verdict:request_changes r=1 y=0 g=0]] [done]"
+                    "<!-- openab-council -->\nReviewed at 0123456789abcdef0123456789abcdef01234567\n## Verdict\n\nblocked\n<!-- openab-findings\n{{\"head_sha\":\"{COMMIT_ID}\",\"findings\":[]}}\n-->\n[[verdict:request_changes r=1 y=0 g=0]] [done]"
                 )]
             }
         })
@@ -6270,7 +6380,7 @@ mod tests {
                 "required_valid_reviewers": 2,
                 "valid_reviewers": 1,
                 "final_messages": [
-                    "<!-- openab-council -->\nLGTM\n[[verdict:approve r=0 y=0 g=2]] [done]"
+                    "<!-- openab-council -->\nReviewed at 0123456789abcdef0123456789abcdef01234567\nLGTM\n[[verdict:approve r=0 y=0 g=2]] [done]"
                 ]
             }
         })
@@ -6337,7 +6447,6 @@ mod tests {
             ("cev_a", "ses_theirs", "normal"),
             // Timeout and supersede have no result to report; a review
             // submitted on a guess is worse than silence.
-            ("cev_b", "ses_ours", "timeout"),
             ("cev_c", "ses_ours", "superseded"),
         ];
         for (event_id, session_id, reason) in cases {
