@@ -2,8 +2,8 @@ name: release
 
 # Tag a version → test, then build + push the plane and controller images.
 #   git tag v0.1.1 && git push origin v0.1.1
-#     → ghcr.io/canyugs/openab-control-plane:0.1.1 and :latest
-#     → ghcr.io/canyugs/github-pr-controller:0.1.1 and :latest
+#     → ghcr.io/zeabur/openab-control-plane:0.1.1 and :latest
+#     → ghcr.io/zeabur/github-pr-controller:0.1.1 and :latest
 #
 # Registry (#192 complete): both images publish to GHCR only, authenticate with
 # the built-in GITHUB_TOKEN (no external secret), and have no anonymous-pull rate
@@ -50,22 +50,22 @@ jobs:
       matrix:
         include:
           - component: plane
-            image: ghcr.io/canyugs/openab-control-plane
+            image: ghcr.io/zeabur/openab-control-plane
             dockerfile: Dockerfile
             arch: amd64
             runner: ubuntu-24.04
           - component: plane
-            image: ghcr.io/canyugs/openab-control-plane
+            image: ghcr.io/zeabur/openab-control-plane
             dockerfile: Dockerfile
             arch: arm64
             runner: ubuntu-24.04-arm
           - component: controller
-            image: ghcr.io/canyugs/github-pr-controller
+            image: ghcr.io/zeabur/github-pr-controller
             dockerfile: Dockerfile.github-controller
             arch: amd64
             runner: ubuntu-24.04
           - component: controller
-            image: ghcr.io/canyugs/github-pr-controller
+            image: ghcr.io/zeabur/github-pr-controller
             dockerfile: Dockerfile.github-controller
             arch: arm64
             runner: ubuntu-24.04-arm
@@ -108,9 +108,9 @@ jobs:
       matrix:
         include:
           - component: plane
-            image: ghcr.io/canyugs/openab-control-plane
+            image: ghcr.io/zeabur/openab-control-plane
           - component: controller
-            image: ghcr.io/canyugs/github-pr-controller
+            image: ghcr.io/zeabur/github-pr-controller
     runs-on: ubuntu-24.04
     steps:
       - name: Log in to GHCR
