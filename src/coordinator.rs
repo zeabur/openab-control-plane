@@ -74,9 +74,11 @@ pub enum Action {
     /// Relays of the reviewers' finals (the new chair received none of the
     /// session's earlier fanout) and a synthesis Prompt.
     ReassignChair { to: String },
-    /// Remove a reviewer whose done-signal did not carry a delivered report.
-    /// The orchestrator prefers a same-role spare before shrinking the roster.
-    TrimReviewer { bot: String },
+    /// Swap a reviewer whose done-signals never carried a delivered report for
+    /// a same-role spare. A no-op when no spare is registered: the roster must
+    /// not shrink here, because a fixed `quorum_n` would become unreachable and
+    /// fail-close a round whose report is merely late.
+    ReplaceReviewerIfSpare { bot: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,9 +237,19 @@ fn reviewer_report_delivered(cx: &dyn Ctx, bot: &str, explicit: bool) -> bool {
             .is_some_and(crate::plugins::council::review_report_delivered)
 }
 
+/// A reviewer that has not delivered yet is re-prompted, and once the budget is
+/// spent it may be swapped for a standby — but it is never removed outright.
+/// `counted_done_voters` already refuses to count a reviewer without a
+/// delivered report, which is the whole safety property; dropping it from the
+/// roster additionally makes the fixed `quorum_n` unreachable and kills the
+/// round (`insufficient_valid_reviewers`). Reviewers routinely end their
+/// opening turn before the report and deliver minutes later — nuphos#1231
+/// round 1 fail-closed at 22:49:04Z while rev-claude's report arrived at
+/// 22:58:10Z — so the roster must outlive the re-request budget. A reviewer
+/// that never delivers at all is the watchdog's job, not this path's.
 fn invalid_reviewer_action(bot: &str, attempts: i64) -> Action {
     if attempts >= MAX_REVIEWER_REREQUESTS {
-        return Action::TrimReviewer {
+        return Action::ReplaceReviewerIfSpare {
             bot: bot.to_string(),
         };
     }
@@ -708,7 +720,7 @@ mod tests {
     }
 
     #[test]
-    fn contract_reviewer_rerequest_exhaustion_trims_the_reviewer() {
+    fn contract_reviewer_rerequest_exhaustion_swaps_but_never_drops_the_seat() {
         let mut cx = quorum_ctx(&trailed());
         cx.settled.insert("rev-a".into(), "PONG [done]".into());
         let actions = council_on_done_with_reviewer_rerequest_attempts(
@@ -721,7 +733,7 @@ mod tests {
 
         assert!(actions.iter().any(|action| matches!(
             action,
-            Action::TrimReviewer { bot } if bot == "rev-a"
+            Action::ReplaceReviewerIfSpare { bot } if bot == "rev-a"
         )));
         assert!(!actions.iter().any(|action| matches!(
             action,
@@ -748,7 +760,7 @@ mod tests {
         )));
         assert!(!actions.iter().any(|action| matches!(
             action,
-            Action::TrimReviewer { bot } if bot == "rev-b"
+            Action::ReplaceReviewerIfSpare { bot } if bot == "rev-b"
         )));
     }
 
@@ -768,7 +780,7 @@ mod tests {
         )));
         assert!(!actions.iter().any(|action| matches!(
             action,
-            Action::TrimReviewer { bot } if bot == "rev-a"
+            Action::ReplaceReviewerIfSpare { bot } if bot == "rev-a"
         )));
     }
 

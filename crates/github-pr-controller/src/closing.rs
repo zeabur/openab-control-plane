@@ -380,41 +380,30 @@ fn classify_integrity(target: &SessionTarget, parsed: &ParsedResult) -> Integrit
             reviewed_sha: Some(reviewed_raw.to_string()),
         };
     }
-    // A valid SHA and trailer alone cannot authorize a review without the
-    // report the controller will actually publish. Inspect the same last
-    // anchor as comment_body, excluding trailing working noise.
-    let report = parsed
-        .source
-        .rsplit_once(REPORT_START)
-        .map(|(_, report)| report.split("[[verdict:").next().unwrap_or_default());
-    let report_failure = match report {
-        None => Some("missing_report"),
-        Some(report)
-            if !report.lines().any(|line| {
-                line.trim()
-                    .strip_prefix("Reviewed at ")
-                    .is_some_and(|claim| {
-                        let sha = claim
-                            .split_whitespace()
-                            .next()
-                            .unwrap_or_default()
-                            .trim_matches('`');
-                        canonical_commit_id(sha).as_deref() == Some(target_commit_id.as_str())
-                    })
-            }) =>
-        {
-            Some("missing_reviewed_at")
-        }
-        _ => None,
-    };
-    if let Some(disposition) = report_failure {
-        return IntegrityDecision {
-            disposition,
-            target_commit_id: Some(target_commit_id),
-            verified_commit_id: None,
-            reviewed_sha: Some(reviewed_commit_id),
-        };
-    }
+    // Integrity is about SHA provenance, and that is now fully established: the
+    // machine-readable findings block named a reviewed SHA and it equals the
+    // target. It deliberately does NOT also require the chair's prose to carry
+    // the `<!-- openab-council -->` anchor or a literal `Reviewed at <sha>`
+    // line. Those were a second, LLM-typed copy of a fact the controller already
+    // holds authoritatively, and withholding the review when the copy was
+    // missing discarded three fully-deliberated verdicts in 50 minutes
+    // (nuphos#1232 r2, #1233 r4, #1237 r2 — all `missing_report`). The
+    // no-anchor case stays safe without this gate: `comment_body` never
+    // publishes unanchored raw text, it rebuilds a `degraded_body` from the
+    // trailer and the findings block.
+    //
+    // The gate was also wrong by construction, not merely unreliable in
+    // transport. It read the window after the LAST `REPORT_START` via
+    // `rsplit_once`, so a report that *quotes* the anchor — which any review of
+    // this controller's own code does — pushed the real `Reviewed at` line
+    // outside the window. The round that reviewed this very commit proved it:
+    // the chair emitted both the anchor and `Reviewed at
+    // 579387339581043528e0b8325d19cb7df19f881a (round 1)`, and its
+    // `request_changes` was still withheld as `missing_reviewed_at`. A gate
+    // that fails on correct input cannot be the thing authorizing a review.
+    // What authorizes it instead is the pair the chair finds hardest to emit by
+    // accident and that survives at the tail: a parseable verdict trailer and a
+    // findings block whose `head_sha` equals the webhook's head.
     IntegrityDecision {
         disposition: "verified",
         target_commit_id: Some(reviewed_commit_id.clone()),
@@ -1200,23 +1189,50 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_report_cannot_publish_either_verdict_or_findings() {
-        for verdict in ["approve", "request_changes"] {
+    /// A report whose prose anchor did not survive transport still publishes.
+    /// The bot-side gateway clips an over-long chair report from the FRONT
+    /// (a `…`-prefixed message), and the `<!-- openab-council -->` anchor sits
+    /// at the front by protocol — so demanding it in the prose discarded three
+    /// fully-deliberated verdicts in 50 minutes (nuphos#1232 r2, #1233 r4,
+    /// #1237 r2). Provenance comes from the findings block, which survives at
+    /// the tail together with the trailer; `comment_body` still refuses to
+    /// publish unanchored raw text and falls back to the degraded body.
+    #[test]
+    fn a_report_without_its_prose_anchor_still_publishes_the_verdict() {
+        for (verdict, counts) in [("approve", "r=0 y=0 g=0"), ("request_changes", "r=1 y=0 g=0")] {
             for prefix in [
                 "",
                 "<!-- openab-council -->\n",
                 "<!-- openab-council -->\nReviewed at deadbeef\n",
             ] {
-                let source = format!("{prefix}Report prose\n<!-- openab-findings\n{{\"head_sha\":\"0123456789abcdef0123456789abcdef01234567\",\"findings\":[]}}\n-->\n[[verdict:{verdict} r=0 y=0 g=0]] [done]");
+                let source = format!("{prefix}Report prose\n<!-- openab-findings\n{{\"head_sha\":\"0123456789abcdef0123456789abcdef01234567\",\"findings\":[]}}\n-->\n[[verdict:{verdict} {counts}]] [done]");
                 let parsed = parse_final_messages(&[source]);
                 let plan = plan_close(&target(), &parsed, None, "ses_incomplete", false);
-                assert_eq!(kinds(&plan), [KIND_COMMENT, KIND_STATUS]);
-                assert_eq!(write(&plan, KIND_STATUS)["state"], "error");
-                assert!(plan.findings.is_empty());
-                assert!(plan.fired_waivers.is_empty());
-                assert!(plan.verified_commit_id.is_none());
+                assert_eq!(kinds(&plan), [KIND_COMMENT, KIND_STATUS, KIND_REVIEW]);
+                assert_ne!(write(&plan, KIND_STATUS)["state"], "error");
+                assert_eq!(plan.decision, verdict);
+                assert_eq!(
+                    plan.verified_commit_id.as_deref(),
+                    Some("0123456789abcdef0123456789abcdef01234567")
+                );
             }
         }
+    }
+
+    /// The provenance gate that must stay: a findings block naming some other
+    /// commit can never authorize a review on the webhook's head sha.
+    #[test]
+    fn a_findings_block_for_another_commit_still_fails_closed() {
+        let parsed = parse_final_messages(&[concat!(
+            "<!-- openab-council -->\nReport prose\n",
+            "<!-- openab-findings\n{\"head_sha\":\"ffffffffffffffffffffffffffffffffffffffff\",\"findings\":[]}\n-->\n",
+            "[[verdict:approve r=0 y=0 g=0]] [done]"
+        )
+        .into()]);
+        let plan = plan_close(&target(), &parsed, None, "ses_mismatch", false);
+        assert_eq!(plan.decision, "sha_integrity_failed");
+        assert_eq!(plan.integrity_disposition, "reviewed_sha_mismatch");
+        assert!(plan.verified_commit_id.is_none());
     }
 
     #[test]
