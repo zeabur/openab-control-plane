@@ -3340,7 +3340,10 @@ mod tests {
             .advance_state(&session.id, SessionState::Open, SessionState::Deliberating)
             .unwrap();
 
-        trim_reviewer_body(&state, &session.id, &rev2.id, "report_not_delivered").unwrap();
+        // `"unreachable"` is the only reason that still reaches this path: the
+        // report-delivery caller keeps the seat instead of trimming, so a
+        // controller review can now only fall below its minimum by losing a bot.
+        trim_reviewer_body(&state, &session.id, &rev2.id, "unreachable").unwrap();
 
         let current = store.session(&session.id).unwrap().unwrap();
         assert_eq!(current.quorum_n, 2, "the opening minimum is immutable");

@@ -391,6 +391,19 @@ fn classify_integrity(target: &SessionTarget, parsed: &ParsedResult) -> Integrit
     // no-anchor case stays safe without this gate: `comment_body` never
     // publishes unanchored raw text, it rebuilds a `degraded_body` from the
     // trailer and the findings block.
+    //
+    // The gate was also wrong by construction, not merely unreliable in
+    // transport. It read the window after the LAST `REPORT_START` via
+    // `rsplit_once`, so a report that *quotes* the anchor — which any review of
+    // this controller's own code does — pushed the real `Reviewed at` line
+    // outside the window. The round that reviewed this very commit proved it:
+    // the chair emitted both the anchor and `Reviewed at
+    // 579387339581043528e0b8325d19cb7df19f881a (round 1)`, and its
+    // `request_changes` was still withheld as `missing_reviewed_at`. A gate
+    // that fails on correct input cannot be the thing authorizing a review.
+    // What authorizes it instead is the pair the chair finds hardest to emit by
+    // accident and that survives at the tail: a parseable verdict trailer and a
+    // findings block whose `head_sha` equals the webhook's head.
     IntegrityDecision {
         disposition: "verified",
         target_commit_id: Some(reviewed_commit_id.clone()),
