@@ -565,10 +565,14 @@ fn trim_reviewer(state: &Arc<AppState>, session_id: &str, bot_id: &str) -> Resul
     trim_reviewer_body(state, session_id, bot_id, "unreachable")
 }
 
-/// The report-delivery action has the same capacity-preserving preference as
-/// liveness: use a connected same-role spare when one is available, and only
-/// shrink the roster when replacement cannot be completed.
-fn replace_or_trim_reviewer(state: &Arc<AppState>, session_id: &str, bot_id: &str) -> Result<()> {
+/// Report-delivery keeps liveness's capacity-preserving preference — use a
+/// connected same-role spare when one is available — but unlike liveness it
+/// must never shrink the roster. A reviewer that is merely slow still holds a
+/// seat the fixed `quorum_n` needs; removing it turned nuphos#1231 round 1 into
+/// an `insufficient_valid_reviewers` fail-close 9 minutes before the report
+/// actually arrived. Without a spare the reviewer keeps its seat and the round
+/// waits — the watchdog is the only backstop for one that never delivers.
+fn replace_reviewer_if_spare(state: &Arc<AppState>, session_id: &str, bot_id: &str) -> Result<()> {
     if let Some(inv) = state.store.bot_inventory(bot_id)? {
         if let Some(spare) = find_spare(state, session_id, &inv, false)? {
             match replace_roster_bot(state, session_id, bot_id, &spare)? {
@@ -584,7 +588,11 @@ fn replace_or_trim_reviewer(state: &Arc<AppState>, session_id: &str, bot_id: &st
             }
         }
     }
-    trim_reviewer_body(state, session_id, bot_id, "report_not_delivered")
+    tracing::warn!(
+        "report-delivery: {bot_id} has not delivered a report in {session_id} and no spare is \
+         available; keeping its roster seat so a late report can still close the round"
+    );
+    Ok(())
 }
 
 /// Remove a reviewer, shrink the quorum, and re-run the coordinator's roster
@@ -1975,9 +1983,9 @@ fn run_actions(state: &Arc<AppState>, session: &Session, actions: Vec<Action>) -
                 }
                 state.emit_north("chair_reassigned", &session.id, json!({ "chair": to }));
             }
-            Action::TrimReviewer { bot } => {
+            Action::ReplaceReviewerIfSpare { bot } => {
                 transition_failed = false;
-                replace_or_trim_reviewer(state, &session.id, &bot)?;
+                replace_reviewer_if_spare(state, &session.id, &bot)?;
             }
             Action::Transition { from, to } => {
                 let to_str = to.as_str();
@@ -2300,7 +2308,7 @@ mod tests {
     /// quorum_n = 0, where `0 >= 0` convenes the chair to synthesize from
     /// nothing.
     #[test]
-    fn trimming_the_last_reviewer_fail_closes_instead_of_convening() {
+    fn an_undelivering_last_reviewer_keeps_its_seat_instead_of_fail_closing() {
         let store = Arc::new(SqliteStore::memory().unwrap());
         let state = AppState::new(store.clone());
         let chair = store.register_bot("chair", "chair", "h1", "t1").unwrap();
@@ -2318,25 +2326,32 @@ mod tests {
         store
             .advance_state(&session.id, SessionState::Open, SessionState::Deliberating)
             .unwrap();
-        // Blank-vote through exhaustion (no spare registered): re-requests,
-        // then the trim that would zero the roster.
+        // Blank-vote past exhaustion (no spare registered): re-requests, then
+        // nothing. The seat must survive — a reviewer whose report is merely
+        // late still holds the seat `quorum_n` needs, and removing it turned
+        // nuphos#1231 round 1 into an `insufficient_valid_reviewers` fail-close
+        // 9 minutes before the report actually arrived.
         for _ in 0..4 {
             handle_reply(&state, &rev.id, msg_reply(&session.id, "ok [done]")).unwrap();
         }
         let after = store.session(&session.id).unwrap().unwrap();
         assert_eq!(
             SessionState::from_db_str(&after.state),
-            SessionState::Closed,
-            "roster exhaustion fail-closes"
+            SessionState::Deliberating,
+            "an undelivered report must not fail-close the round"
         );
         assert!(after.decision.is_none(), "no verdict is fabricated");
+        assert!(
+            store.roster(&session.id).unwrap().contains(&rev.id),
+            "the reviewer keeps its seat so a late report can still close the round"
+        );
         assert!(
             !store
                 .messages(&session.id)
                 .unwrap()
                 .iter()
                 .any(|m| m.author_kind == "system" && m.content.starts_with("Quorum reached.")),
-            "the chair must never be convened against an empty roster"
+            "the chair must never be convened without a delivered report"
         );
     }
 
@@ -3389,12 +3404,19 @@ mod tests {
         }
 
         let current = store.session(&session.id).unwrap().unwrap();
-        assert_eq!(current.quorum_n, 2);
+        assert_eq!(current.quorum_n, 2, "the reviewer minimum is immutable");
+        // The seat is not taken away, so the round stays open and the watchdog
+        // is the backstop. What matters is that the failed frame buys nothing:
+        // no quorum, no verdict, and nothing relayed to the chair.
         assert_eq!(
             SessionState::from_db_str(&current.state),
-            SessionState::Closed
+            SessionState::Deliberating
         );
         assert!(current.decision.is_none(), "no verdict may be fabricated");
+        assert!(
+            store.roster(&session.id).unwrap().contains(&rev_claude.id),
+            "a failing reviewer keeps its seat; quorum simply stays unmet"
+        );
         assert!(
             store
                 .messages(&session.id)
@@ -3406,7 +3428,7 @@ mod tests {
     }
 
     #[test]
-    fn connected_blank_reviewer_retries_then_trims_through_real_store() {
+    fn connected_blank_reviewer_retries_then_keeps_its_seat_through_real_store() {
         let store = Arc::new(SqliteStore::memory().unwrap());
         let state = AppState::new(store.clone());
         let chair = store.register_bot("chair", "chair", "h1", "t1").unwrap();
@@ -3434,15 +3456,21 @@ mod tests {
         }
 
         let roster = store.roster(&session.id).unwrap();
-        assert_eq!(roster, vec![chair.id.clone()]);
+        assert_eq!(
+            roster,
+            vec![chair.id.clone(), reviewer.id.clone()],
+            "the seat survives an exhausted retry budget"
+        );
         let current = store.session(&session.id).unwrap().unwrap();
-        // Roster exhaustion fail-closes: quorum_n = 0 would make `0 >= 0` a
-        // trivial quorum and convene the chair against nothing (council red
-        // on the #349 sibling review).
+        // The round stays open instead of fail-closing. Quorum is still
+        // unreachable — `counted_done_voters` refuses a reviewer without a
+        // delivered report, so the chair is not convened against nothing
+        // (council red on the #349 sibling review) — but a late report can
+        // still arrive and close the round, and the watchdog is the backstop.
         assert_eq!(
             SessionState::from_db_str(&current.state),
-            SessionState::Closed,
-            "exhausting the last reviewer fail-closes the session"
+            SessionState::Deliberating,
+            "an exhausted retry budget must not fail-close the session"
         );
         assert!(current.decision.is_none(), "no verdict is fabricated");
         let messages = store.messages(&session.id).unwrap();
@@ -3470,7 +3498,7 @@ mod tests {
                 })
                 .count(),
             0,
-            "the chair must never be convened against an empty roster",
+            "the chair must never be convened without a delivered report",
         );
     }
 
