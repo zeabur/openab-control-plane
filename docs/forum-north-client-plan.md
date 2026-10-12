@@ -48,7 +48,7 @@ Reference stack:
 │ Support pod (Allen profile)         │
 │  ghcr.io/openabdev/openab:*-claude   │
 │  [gateway] → OCP                    │
-│  AGENTS.md + zadmin/zforum/rag skills│
+│  AGENTS.md + zadmin/zsupport/rag skills│
 └─────────────────────────────────────┘
 ```
 
@@ -329,7 +329,7 @@ Linear: {linearIdf}
 Staff request:
 {userMessage}
 
-Use your support skills (zforum, zadmin, zeabur-rag, etc.). Read the full thread
+Use your support skills (zsupport, zadmin, zeabur-rag, etc.). Read the full thread
 before answering. Do not post a public forum reply unless explicitly asked.
 ```
 
@@ -394,7 +394,7 @@ forum must never depend on reopen.
 | `app/(main)/queue/queue-list.tsx` | “Open Agent” (replace or beside Copy Claude) |
 
 Panel is **staff-only**; customer thread unchanged unless staff posts manually or
-bot uses zforum.
+bot uses zsupport.
 
 ### Phase 3 — Optional Mongo
 
@@ -435,7 +435,7 @@ OCP remains source of truth; Mongo is convenience for lookups.
 |------|-----|-------|
 | ~~`POST /v1/sessions` no dedupe~~ resolved: fingerprint dedupe/supersede shipped (#126) | Pass `trigger_fingerprint`; resolve-first kept for UX | Atomic open-with-`prompt` at Stage 3 S5 |
 | `solo` one turn per session | New session per follow-up after close | OCP `chat` mode (long-lived) |
-| Reply to customer | Manual or bot zforum | “Post to thread” button in panel |
+| Reply to customer | Manual or bot zsupport | “Post to thread” button in panel |
 | Bot disconnected | 502 + UI message | Alerting |
 
 ---
